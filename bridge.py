@@ -77,6 +77,7 @@ CONTROL_GUIDE = (
     "/ds pause：暂停后续任务，当前任务继续\n"
     "/ds resume：恢复执行\n"
     "/ds stop：紧急停止当前任务、取消排队，并保持暂停\n"
+    "/ds new mission：下个任务开始新聊天，之后继续该聊天\n"
     "/ds stream on / /ds stream off：开启或关闭流式回传\n"
     "/ds files retry <8位任务编号>：重试发送未回传的文件\n"
     "/ds help：查看指令说明"
@@ -116,6 +117,11 @@ class Task:
     sender: str
     prompt: str
     attachments: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class NewMission:
+    chat_id: int
 
 
 def load_config(path: Path) -> Config:
@@ -428,7 +434,7 @@ class Bridge:
     def __init__(self, config: Config):
         self.config = config
         self.db = StateDB(config.state_db)
-        self.tasks: queue.Queue[Task] = queue.Queue()
+        self.tasks: queue.Queue[Task | NewMission] = queue.Queue()
         self.stop_event = threading.Event()
         self.cancel_event = threading.Event()
         self.active_lock = threading.Lock()
@@ -437,11 +443,24 @@ class Bridge:
         self.cancelled_task_id: str | None = None
         self.paused = self.db.get_setting("paused", "0") == "1"
         self.stream_enabled = self.db.get_setting("stream_enabled", "0") == "1"
+        self.current_session_id = self.db.get_setting("session_id", "") or None
+        if self.db.get_setting("new_mission_pending", "0") == "1":
+            # Queued tasks do not survive a process restart, so a pending
+            # mission boundary becomes the next task's starting point.
+            self.current_session_id = None
+            self.db.set_setting("session_id", "")
+            self.db.set_setting("new_mission_pending", "0")
 
     @staticmethod
     def session_dirs() -> set[Path]:
         root = Path.home() / ".dsh" / "sessions"
         return {path for path in root.glob("*/session-*") if path.is_dir()}
+
+    def session_exists_in_workspace(self, session_id: str) -> bool:
+        if not re.fullmatch(r"session-[0-9a-f-]+", session_id):
+            return False
+        matches = [folder for folder in self.session_dirs() if folder.name == session_id]
+        return len(matches) == 1 and self.session_cwd(matches[0]) == str(self.config.workspace)
 
     @staticmethod
     def session_cwd(folder: Path) -> str | None:
@@ -462,12 +481,16 @@ class Bridge:
                 continue
         return None
 
-    def register_new_sessions(self, before: set[Path]) -> None:
+    def register_new_sessions(self, before: set[Path]) -> list[str]:
         added = self.session_dirs() - before
         session_ids = [folder.name for folder in added
                        if self.session_cwd(folder) == str(self.config.workspace)]
         if not session_ids:
-            return
+            return []
+        self.register_workspace_sessions(session_ids)
+        return sorted(session_ids)
+
+    def register_workspace_sessions(self, session_ids: list[str]) -> bool:
         index = Path.home() / ".dsh" / "storages" / "workspace.json"
         try:
             data = json.loads(index.read_text(encoding="utf-8"))
@@ -476,13 +499,19 @@ class Bridge:
                         if row.get("path") == str(self.config.workspace)]
             if len(matching) != 1:
                 logging.error("bridge workspace is missing or ambiguous in DSH index")
-                return
+                return False
             row = matching[0]
             ids = row.setdefault("sessionIds", [])
+            changed = False
             for session_id in sorted(session_ids):
                 if session_id not in ids:
                     ids.append(session_id)
+                    changed = True
             archived = data.get("global", {}).get("archivedSessionIds", [])
+            if any(session_id in archived for session_id in session_ids):
+                changed = True
+            if not changed:
+                return True
             data["global"]["archivedSessionIds"] = [
                 session_id for session_id in archived if session_id not in session_ids
             ]
@@ -497,8 +526,10 @@ class Bridge:
             os.chmod(pending, 0o600)
             os.replace(pending, index)
             logging.info("registered %s bridge session(s) in desktop workspace", len(session_ids))
+            return True
         except (OSError, ValueError, TypeError, KeyError) as exc:
             logging.error("could not register bridge sessions: %s", exc)
+            return False
 
     def terminate_active(self) -> str | None:
         with self.active_lock:
@@ -515,7 +546,7 @@ class Bridge:
 
     def handle_control(self, body: str, guid: str, chat_id: int) -> bool:
         command = body.strip().lower()
-        if command not in {"help", "status", "states", "pause", "resume", "stop", "stream on", "stream off"} and not command.startswith("files retry "):
+        if command not in {"help", "status", "states", "pause", "resume", "stop", "new mission", "stream on", "stream off"} and not command.startswith("files retry "):
             return False
         if not self.db.claim_control(guid):
             return True
@@ -526,9 +557,15 @@ class Bridge:
                 active = self.active_task_id or "无"
                 paused = self.paused
                 streaming = self.stream_enabled
+                session_id = self.current_session_id or "待创建"
             self.send(chat_id, f"桥接状态：{'暂停' if paused else '运行'}；"
                       f"流式回传{'开' if streaming else '关'}；当前任务 {active}；"
-                      f"排队 {self.tasks.qsize()}。\n\n{CONTROL_GUIDE}")
+                      f"排队 {self.tasks.qsize()}；会话 {session_id}。\n\n{CONTROL_GUIDE}")
+        elif command == "new mission":
+            self.db.set_setting("new_mission_pending", "1")
+            self.tasks.put(NewMission(chat_id))
+            self.send(chat_id, "已安排新聊天：先完成此前排队任务；下一条新任务会创建新会话，"
+                      "之后的任务将继续该会话。")
         elif command == "pause":
             with self.active_lock:
                 self.paused = True
@@ -548,13 +585,19 @@ class Bridge:
             self.db.set_setting("paused", "1")
             active = self.terminate_active()
             cancelled = 0
+            cancelled_boundary = False
             while True:
                 try:
-                    self.tasks.get_nowait()
+                    item = self.tasks.get_nowait()
                 except queue.Empty:
                     break
                 self.tasks.task_done()
-                cancelled += 1
+                if isinstance(item, NewMission):
+                    cancelled_boundary = True
+                else:
+                    cancelled += 1
+            if cancelled_boundary:
+                self.db.set_setting("new_mission_pending", "0")
             self.db.stop_pending()
             self.send(chat_id, f"急停已执行：当前任务 {active or '无'} 已请求终止，"
                       f"取消排队 {cancelled} 项；桥接保持暂停。用 /ds resume 恢复。")
@@ -881,6 +924,13 @@ class Bridge:
             except queue.Empty:
                 continue
             try:
+                if isinstance(task, NewMission):
+                    with self.active_lock:
+                        self.current_session_id = None
+                    self.db.set_setting("session_id", "")
+                    self.db.set_setting("new_mission_pending", "0")
+                    self.send(task.chat_id, "新聊天已就绪；下一条任务会创建新会话。")
+                    continue
                 while not self.stop_event.is_set():
                     with self.active_lock:
                         paused = self.paused
@@ -920,21 +970,33 @@ class Bridge:
             with self.active_lock:
                 self.active_task_id = None
             return
+        with self.active_lock:
+            session_id = self.current_session_id
+        if session_id and not self.session_exists_in_workspace(session_id):
+            self.db.update_status(task.task_id, "failed")
+            self.send(task.chat_id, "当前 DSH 聊天已不存在或不属于桥接工作区；"
+                      "桥接器没有另开聊天。请发送 /ds new mission，再重发任务。")
+            with self.active_lock:
+                self.active_task_id = None
+            return
         command = [
             str(self.config.node),
             str(self.config.dsh_entry),
             "--profile",
             "headless",
-            build_harness_prompt(
-                task,
-                outbox,
-                self.config.max_outbound_attachments,
-                self.config.max_outbound_attachment_bytes,
-                project_dir,
-            ),
         ]
+        if session_id:
+            command.extend(["--session-id", session_id])
+        command.append(build_harness_prompt(
+            task,
+            outbox,
+            self.config.max_outbound_attachments,
+            self.config.max_outbound_attachment_bytes,
+            project_dir,
+        ))
         started = time.monotonic()
         existing_sessions = self.session_dirs()
+        sessions_registered = False
         try:
             with self.active_lock:
                 if self.cancelled_task_id == task.task_id:
@@ -1028,9 +1090,28 @@ class Bridge:
             if proc.returncode != 0:
                 self.db.update_status(task.task_id, "failed")
                 detail = (errors or "DS Harness 未返回错误详情").strip()
-                safe_detail = detail[-500:]
+                safe_detail = ("当前聊天正被 DSH 桌面端占用；请切换桌面端会话或退出后重发。"
+                               "桥接器不会另开聊天。"
+                               if "already owned by an active write handle" in detail
+                               else detail[-500:])
                 self.send(task.chat_id, f"任务 #{task.task_id} 执行失败：{safe_detail}")
                 return
+
+            if not session_id:
+                created = self.register_new_sessions(existing_sessions)
+                sessions_registered = True
+                if len(created) != 1:
+                    self.db.update_status(task.task_id, "failed")
+                    self.send(task.chat_id, f"任务 #{task.task_id} 已得到模型结果，但无法唯一定位"
+                              "新聊天；为避免后续任务误开会话，桥接器已停止续接。请人工检查。")
+                    return
+                session_id = created[0]
+                with self.active_lock:
+                    self.current_session_id = session_id
+                self.db.set_setting("session_id", session_id)
+            if not self.register_workspace_sessions([session_id]):
+                self.send(task.chat_id, "提示：任务仍在桥接工作目录中完成，但桌面端工作区索引"
+                          "未能登记此聊天；请检查 iMessage桥接 工作区是否存在。")
 
             self.db.update_status(task.task_id, "completed")
             with self.active_lock:
@@ -1055,7 +1136,8 @@ class Bridge:
             logging.exception("task %s failed", task.task_id)
             self.send(task.chat_id, f"任务 #{task.task_id} 启动失败：{exc}")
         finally:
-            self.register_new_sessions(existing_sessions)
+            if not sessions_registered:
+                self.register_new_sessions(existing_sessions)
             with self.active_lock:
                 self.active_process = None
                 self.active_task_id = None

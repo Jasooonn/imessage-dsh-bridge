@@ -244,8 +244,11 @@ class BridgeControlTest(unittest.TestCase):
         self.bridge.config = replace(self.config, node=Path(sys.executable), dsh_entry=fake)
         task = Task("g-run", "abcddcba", 1, "+8612000000000", "测试")
         self.bridge.db.add(task)
-        self.bridge.run_task(task)
+        with mock.patch.object(self.bridge, "register_new_sessions", return_value=["session-test"]):
+            with mock.patch.object(self.bridge, "register_workspace_sessions", return_value=True):
+                self.bridge.run_task(task)
         self.assertEqual(self.bridge.db.task_status(task.task_id), "completed")
+        self.assertEqual(self.bridge.db.get_setting("session_id", ""), "session-test")
         self.assertTrue((self.config.workspace / "projects" / task.task_id).is_dir())
         self.assertTrue(any("FAKE_RESULT" in message for message in self.messages))
 
@@ -256,9 +259,70 @@ class BridgeControlTest(unittest.TestCase):
         self.event("stream-2", "/ds stream on")
         task = Task("g-stream", "abcdef12", 1, "+8612000000000", "测试")
         self.bridge.db.add(task)
-        self.bridge.run_task(task)
+        with mock.patch.object(self.bridge, "register_new_sessions", return_value=["session-test"]):
+            with mock.patch.object(self.bridge, "register_workspace_sessions", return_value=True):
+                self.bridge.run_task(task)
         self.assertTrue(any(message.startswith("流式｜") for message in self.messages))
         self.assertEqual(self.bridge.db.task_status(task.task_id), "completed")
+
+    def test_subsequent_tasks_resume_one_session_until_new_mission(self):
+        fake = Path(self._tmp.name) / "fake_resume.py"
+        fake.write_text(
+            "import sys\n"
+            "args = sys.argv[1:]\n"
+            "print('SESSION=' + (args[args.index('--session-id') + 1] "
+            "if '--session-id' in args else 'NEW'))\n",
+            encoding="utf-8",
+        )
+        self.bridge.config = replace(self.config, node=Path(sys.executable), dsh_entry=fake)
+        first = Task("first", "aaaa1111", 1, "+8612000000000", "第一项")
+        second = Task("second", "bbbb2222", 1, "+8612000000000", "第二项")
+        self.bridge.db.add(first)
+        self.bridge.db.add(second)
+        with mock.patch.object(self.bridge, "register_workspace_sessions", return_value=True):
+            with mock.patch.object(self.bridge, "register_new_sessions", return_value=["session-test"]):
+                self.bridge.run_task(first)
+            with mock.patch.object(self.bridge, "session_exists_in_workspace", return_value=True):
+                self.bridge.run_task(second)
+        self.assertTrue(any("SESSION=NEW" in message for message in self.messages))
+        self.assertTrue(any("SESSION=session-test" in message for message in self.messages))
+        self.assertEqual(self.bridge.db.get_setting("session_id", ""), "session-test")
+
+        self.event("mission-boundary", "/ds new mission")
+        marker = self.bridge.tasks.get_nowait()
+        self.bridge.tasks.task_done()
+        self.assertEqual(marker.chat_id, 1)
+        self.assertEqual(self.bridge.db.get_setting("new_mission_pending", ""), "1")
+
+    def test_new_mission_is_applied_before_next_queued_task(self):
+        self.bridge.current_session_id = "session-old"
+        self.bridge.db.set_setting("session_id", "session-old")
+        self.event("mission-marker", "/ds new mission")
+        worker = threading.Thread(target=self.bridge.worker, daemon=True)
+        worker.start()
+        for _ in range(100):
+            if self.bridge.db.get_setting("new_mission_pending", "1") == "0":
+                break
+            time.sleep(0.01)
+        self.bridge.stop_event.set()
+        worker.join(timeout=2)
+        self.assertIsNone(self.bridge.current_session_id)
+        self.assertEqual(self.bridge.db.get_setting("session_id", "missing"), "")
+        self.assertTrue(any("新聊天已就绪" in message for message in self.messages))
+
+    def test_missing_current_session_does_not_open_another_chat(self):
+        fake = Path(self._tmp.name) / "should_not_run.py"
+        marker = Path(self._tmp.name) / "started"
+        fake.write_text(f"open({str(marker)!r}, 'w').close()\n", encoding="utf-8")
+        self.bridge.config = replace(self.config, node=Path(sys.executable), dsh_entry=fake)
+        self.bridge.current_session_id = "session-missing"
+        task = Task("missing", "cccc3333", 1, "+8612000000000", "继续")
+        self.bridge.db.add(task)
+        with mock.patch.object(self.bridge, "session_exists_in_workspace", return_value=False):
+            self.bridge.run_task(task)
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.bridge.db.task_status(task.task_id), "failed")
+        self.assertTrue(any("没有另开聊天" in message for message in self.messages))
 
     def test_emergency_stop_terminates_active_task(self):
         fake = Path(self._tmp.name) / "fake_slow.py"
