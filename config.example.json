@@ -1,0 +1,20 @@
+{
+  "enabled": false,
+  "allowed_sender": "CHANGE_ME",
+  "command_prefix": "/ds ",
+  "workspace": "~/Documents/DSH-iMessage-Bridge",
+  "imsg": "",
+  "node": "/bin/sh",
+  "dsh_entry": "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh",
+  "progress_interval_seconds": 120,
+  "task_timeout_seconds": 3600,
+  "max_task_chars": 6000,
+  "max_message_chars": 1600,
+  "max_attachments": 5,
+  "max_attachment_bytes": 26214400,
+  "max_total_attachment_bytes": 52428800,
+  "attachment_root": "~/Library/Application Support/iMessageDSHarness/inbox",
+  "attachment_copy_helper": "~/Applications/iMessage Attachment Helper.app/Contents/MacOS/attachment-copy-helper",
+  "state_db": "~/Library/Application Support/iMessageDSHarness/state.sqlite3",
+  "log_file": "~/Library/Logs/iMessageDSHarness/bridge.log"
+}
