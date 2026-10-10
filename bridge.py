@@ -32,8 +32,13 @@ from typing import Any
 
 
 HIGH_RISK = re.compile(
-    r"(?:\brm\b|\bsudo\b|\bmkfs\b|\bdiskutil\b|\bformat\b|删除|抹掉|格式化|"
-    r"密码|验证码|api\s*key|token|转账|付款|购买|下单|抢票|发消息|联系他人)",
+    r"(?:\brm\s+-[a-z]*[rf]|\bsudo\s+[A-Za-z0-9_./-]+|\bmkfs(?:\.[a-z0-9]+)?\s+|"
+    r"\bdiskutil\s+(?:erase|partition|apfs\s+delete)|"
+    r"\bformat\s+[a-z]:|"
+    r"(?:删除|抹掉|格式化)(?:系统盘|磁盘|硬盘|分区|目录|文件|U盘|优盘)|"
+    r"(?:读取|查看|导出|发送|泄露)(?:.{0,12})(?:密码|验证码|(?:api\s*key)|密钥|令牌)|"
+    r"转账|付款|下单|抢票|购买(?:门票|机票|商品)|"
+    r"(?:发消息给|联系)(?:.{1,20})(?:联系人|他人|对方|号码))",
     re.IGNORECASE,
 )
 
@@ -70,6 +75,15 @@ SECRETISH_NAME = re.compile(
     re.IGNORECASE,
 )
 
+APPROVAL_PREFIX = "\x1eDS_BRIDGE_APPROVAL "
+APPROVAL_TIMEOUT_SECONDS = 120
+APPROVAL_BLOCKED = re.compile(
+    r"(?:\b(?:sudo|mkfs|diskutil\s+erase|rm\s+-[a-z]*r[a-z]*f|security\s+find)\b|"
+    r"(?:api[_-]?key|password|passwd|passphrase|credential|secret|token|keychain|"
+    r"id_rsa|id_ed25519|\.env)\b|sk-[A-Za-z0-9]{12,})",
+    re.IGNORECASE,
+)
+
 CONTROL_GUIDE = (
     "交互指南：\n"
     "/ds <任务>：提交任务（可附图片或文件）\n"
@@ -78,6 +92,10 @@ CONTROL_GUIDE = (
     "/ds resume：恢复执行\n"
     "/ds stop：紧急停止当前任务、取消排队，并保持暂停\n"
     "/ds new mission：下个任务开始新聊天，之后继续该聊天\n"
+    "/ds confirm <任务编号> <确认码>：确认高风险任务\n"
+    "/ds pending：查看待确认任务；/ds confirm resend <任务编号>：重发确认码\n"
+    "/ds approve <编号>：仅批准当前显示的这一项 DSH 操作\n"
+    "/ds deny <编号>：拒绝当前权限请求（逾时也会自动拒绝）\n"
     "/ds stream on / /ds stream off：开启或关闭流式回传\n"
     "/ds files retry <8位任务编号>：重试发送未回传的文件\n"
     "/ds help：查看指令说明"
@@ -124,6 +142,17 @@ class NewMission:
     chat_id: int
 
 
+@dataclass(frozen=True)
+class PendingApproval:
+    request_id: str
+    task_id: str
+    chat_id: int
+    session_id: str
+    tool: str
+    arguments: str
+    deadline: float
+
+
 def load_config(path: Path) -> Config:
     with path.open("r", encoding="utf-8") as fh:
         raw = json.load(fh)
@@ -132,7 +161,11 @@ def load_config(path: Path) -> Config:
         allowed_sender=str(raw.get("allowed_sender", "")).strip(),
         command_prefix=str(raw.get("command_prefix", "/ds ")),
         workspace=Path(raw["workspace"]).expanduser(),
-        imsg=Path(raw.get("imsg") or shutil.which("imsg") or "/opt/homebrew/bin/imsg"),
+        imsg=Path(raw.get("imsg") or shutil.which("imsg") or next(
+            (str(path) for path in (Path("/opt/homebrew/bin/imsg"),
+                                    Path("/usr/local/bin/imsg")) if path.is_file()),
+            "/opt/homebrew/bin/imsg",
+        )),
         node=Path(raw["node"]),
         dsh_entry=Path(raw["dsh_entry"]),
         progress_interval_seconds=max(30, int(raw.get("progress_interval_seconds", 120))),
@@ -173,14 +206,17 @@ def handles_match(observed: str, allowed: str) -> bool:
     right = normalize_handle(allowed)
     if "@" in left or "@" in right:
         return left == right
-    left_digits = "".join(char for char in left if char.isdigit())
-    right_digits = "".join(char for char in right if char.isdigit())
-    # Chinese mobile handles may be stored by Messages as +86..., 0086...,
-    # or a locally normalized variant. Match the exact 11-digit subscriber
-    # number while keeping email matching strict.
-    if len(left_digits) >= 11 and len(right_digits) >= 11:
-        return left_digits[-11:] == right_digits[-11:]
-    return left == right
+    def canonical_phone(value: str) -> str | None:
+        if value.startswith("+"):
+            digits = value[1:]
+            return "+" + digits if digits.isdigit() and 8 <= len(digits) <= 15 else None
+        if re.fullmatch(r"1[3-9]\d{9}", value):
+            # Only an unprefixed Chinese mobile may be inferred as +86.
+            return "+86" + value
+        return None
+    left_phone = canonical_phone(left)
+    right_phone = canonical_phone(right)
+    return left_phone is not None and left_phone == right_phone
 
 
 def clean_inbound_text(value: str) -> str:
@@ -429,6 +465,23 @@ class StateDB:
         attachments = tuple(json.loads(row[7] or "[]"))
         return Task(row[0], row[1], int(row[2]), row[3], row[4], attachments)
 
+    def pending_confirmations(self, chat_id: int) -> list[str]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT task_id FROM tasks WHERE chat_id=? AND status='awaiting_confirmation' "
+                "ORDER BY created_at DESC LIMIT 10", (chat_id,),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def resend_confirmation(self, task_id: str, chat_id: int, digest: str) -> bool:
+        with self.lock, self.conn:
+            result = self.conn.execute(
+                "UPDATE tasks SET confirm_hash=? WHERE task_id=? AND chat_id=? "
+                "AND status='awaiting_confirmation'",
+                (digest, task_id, chat_id),
+            )
+            return result.rowcount == 1
+
 
 class Bridge:
     def __init__(self, config: Config):
@@ -441,9 +494,11 @@ class Bridge:
         self.active_process: subprocess.Popen[str] | None = None
         self.active_task_id: str | None = None
         self.cancelled_task_id: str | None = None
+        self.pending_approval: PendingApproval | None = None
         self.paused = self.db.get_setting("paused", "0") == "1"
         self.stream_enabled = self.db.get_setting("stream_enabled", "0") == "1"
         self.current_session_id = self.db.get_setting("session_id", "") or None
+        self.session_link_failed = self.db.get_setting("session_link_failed", "0") == "1"
         if self.db.get_setting("new_mission_pending", "0") == "1":
             # Queued tasks do not survive a process restart, so a pending
             # mission boundary becomes the next task's starting point.
@@ -464,8 +519,12 @@ class Bridge:
 
     @staticmethod
     def session_cwd(folder: Path) -> str | None:
-        zstd = shutil.which("zstd")
-        if not zstd:
+        zstd = shutil.which("zstd") or next(
+            (str(path) for path in (Path("/opt/homebrew/bin/zstd"),
+                                    Path("/usr/local/bin/zstd")) if path.is_file()),
+            None,
+        )
+        if zstd is None:
             return None
         for file in folder.glob("*.zstd"):
             try:
@@ -492,44 +551,60 @@ class Bridge:
 
     def register_workspace_sessions(self, session_ids: list[str]) -> bool:
         index = Path.home() / ".dsh" / "storages" / "workspace.json"
-        try:
-            data = json.loads(index.read_text(encoding="utf-8"))
-            rows = data.get("tables", {}).get("workspaces", {})
-            matching = [row for row in rows.values()
-                        if row.get("path") == str(self.config.workspace)]
-            if len(matching) != 1:
-                logging.error("bridge workspace is missing or ambiguous in DSH index")
-                return False
-            row = matching[0]
-            ids = row.setdefault("sessionIds", [])
-            changed = False
-            for session_id in sorted(session_ids):
-                if session_id not in ids:
-                    ids.append(session_id)
+        for attempt in range(3):
+            try:
+                original = index.read_bytes()
+                data = json.loads(original)
+                rows = data.get("tables", {}).get("workspaces", {})
+                matching = [row for row in rows.values()
+                            if row.get("path") == str(self.config.workspace)]
+                if len(matching) != 1:
+                    logging.error("bridge workspace is missing or ambiguous in DSH index")
+                    return False
+                row = matching[0]
+                ids = row.setdefault("sessionIds", [])
+                changed = False
+                for session_id in sorted(session_ids):
+                    if session_id not in ids:
+                        ids.append(session_id)
+                        changed = True
+                global_state = data.setdefault("global", {})
+                archived = global_state.get("archivedSessionIds", [])
+                if any(session_id in archived for session_id in session_ids):
                     changed = True
-            archived = data.get("global", {}).get("archivedSessionIds", [])
-            if any(session_id in archived for session_id in session_ids):
-                changed = True
-            if not changed:
+                if not changed:
+                    return True
+                global_state["archivedSessionIds"] = [
+                    session_id for session_id in archived if session_id not in session_ids
+                ]
+                row["updatedAt"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=index.parent,
+                    prefix=".workspace-bridge-", suffix=".json", delete=False,
+                ) as tmp:
+                    json.dump(data, tmp, ensure_ascii=False, indent=2)
+                    tmp.write("\n")
+                    pending = Path(tmp.name)
+                os.chmod(pending, 0o600)
+                if index.read_bytes() != original:
+                    pending.unlink()
+                    logging.warning("DSH workspace index changed during registration; retry %s", attempt + 1)
+                    continue
+                with tempfile.NamedTemporaryFile(
+                    mode="wb", dir=index.parent, prefix="workspace.bridge-backup-",
+                    suffix=".json", delete=False,
+                ) as backup:
+                    backup.write(original)
+                    backup_path = Path(backup.name)
+                os.chmod(backup_path, 0o600)
+                os.replace(pending, index)
+                logging.info("registered %s bridge session(s) in desktop workspace", len(session_ids))
                 return True
-            data["global"]["archivedSessionIds"] = [
-                session_id for session_id in archived if session_id not in session_ids
-            ]
-            row["updatedAt"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-            with tempfile.NamedTemporaryFile(
-                mode="w", encoding="utf-8", dir=index.parent,
-                prefix=".workspace-bridge-", suffix=".json", delete=False,
-            ) as tmp:
-                json.dump(data, tmp, ensure_ascii=False, indent=2)
-                tmp.write("\n")
-                pending = Path(tmp.name)
-            os.chmod(pending, 0o600)
-            os.replace(pending, index)
-            logging.info("registered %s bridge session(s) in desktop workspace", len(session_ids))
-            return True
-        except (OSError, ValueError, TypeError, KeyError) as exc:
-            logging.error("could not register bridge sessions: %s", exc)
-            return False
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                logging.error("could not register bridge sessions: %s", exc)
+                return False
+        logging.error("DSH workspace index kept changing; registration skipped")
+        return False
 
     def terminate_active(self) -> str | None:
         with self.active_lock:
@@ -544,23 +619,141 @@ class Bridge:
                 logging.warning("could not stop task process group: %s", exc)
         return task_id
 
+    def settle_approval(self, request_id: str, outcome: str) -> PendingApproval | None:
+        with self.active_lock:
+            pending = self.pending_approval
+            if pending is None or pending.request_id != request_id:
+                return None
+            self.pending_approval = None
+            proc = self.active_process
+        if proc is not None and proc.stdin is not None and proc.poll() is None:
+            reply = json.dumps({"type": "ds-approval-decision", "id": request_id,
+                                "outcome": outcome}, separators=(",", ":"))
+            try:
+                proc.stdin.write((reply + "\n").encode("utf-8"))
+                proc.stdin.flush()
+            except (OSError, ValueError) as exc:
+                logging.warning("could not deliver DSH approval decision: %s", exc)
+        return pending
+
+    def handle_approval_request(self, line: str, task: Task) -> None:
+        try:
+            request = json.loads(line[len(APPROVAL_PREFIX):])
+            request_id = request["id"]
+            session_id = request["sessionId"]
+            tool = request["tool"]
+            arguments = request["arguments"]
+            if not all(isinstance(value, str) for value in
+                       (request_id, session_id, tool, arguments)):
+                raise ValueError("invalid approval fields")
+            if not re.fullmatch(r"[0-9a-f-]{36}", request_id):
+                raise ValueError("invalid approval ID")
+            if not re.fullmatch(r"session-[0-9a-f-]+", session_id):
+                raise ValueError("invalid session ID")
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", tool):
+                raise ValueError("invalid tool name")
+            json.loads(arguments)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            logging.warning("rejected malformed DSH approval event: %s", exc)
+            return
+        with self.active_lock:
+            current_session = self.current_session_id
+            busy = self.pending_approval is not None
+            active = self.active_task_id == task.task_id
+        if not active or busy or (current_session and session_id != current_session):
+            self._write_approval_rejection(request_id)
+            return
+        if (len(arguments) > 1000 or len(tool) + len(arguments) > self.config.max_message_chars - 350
+                or APPROVAL_BLOCKED.search(arguments)):
+            self._write_approval_rejection(request_id)
+            self.send(task.chat_id, f"权限请求 #{request_id[:8]} 已自动拒绝：操作过长或涉及"
+                      "凭据、系统级破坏性命令，无法通过 iMessage 安全审批。")
+            return
+        pending = PendingApproval(request_id, task.task_id, task.chat_id,
+                                  session_id, tool, arguments,
+                                  time.monotonic() + APPROVAL_TIMEOUT_SECONDS)
+        with self.active_lock:
+            can_ask = self.pending_approval is None and self.active_task_id == task.task_id
+            if can_ask:
+                self.pending_approval = pending
+        if not can_ask:
+            self._write_approval_rejection(request_id)
+            return
+        delivered = self.send(
+            task.chat_id,
+            f"DSH 权限审批｜任务 #{task.task_id}｜请求 {request_id[:8]}\n"
+            f"工具：{tool}\n操作参数（完整）：{arguments}\n"
+            f"仅此一次，{APPROVAL_TIMEOUT_SECONDS} 秒内回复 /ds approve {request_id[:8]} "
+            f"或 /ds deny {request_id[:8]}。\n"
+            "请核对具体操作；此审批不能替代 macOS 系统权限授权。",
+        )
+        if not delivered:
+            self.settle_approval(request_id, "rejected")
+
+    def _write_approval_rejection(self, request_id: str) -> None:
+        with self.active_lock:
+            proc = self.active_process
+        if proc is not None and proc.stdin is not None and proc.poll() is None:
+            try:
+                proc.stdin.write((json.dumps({"type": "ds-approval-decision",
+                                              "id": request_id,
+                                              "outcome": "rejected"}) + "\n").encode())
+                proc.stdin.flush()
+            except (OSError, ValueError):
+                pass
+
     def handle_control(self, body: str, guid: str, chat_id: int) -> bool:
         command = body.strip().lower()
-        if command not in {"help", "status", "states", "pause", "resume", "stop", "new mission", "stream on", "stream off"} and not command.startswith("files retry "):
+        if command not in {"help", "status", "states", "pause", "resume", "stop", "new mission", "stream on", "stream off", "approve", "deny", "pending"} and not command.startswith(("files retry ", "approve ", "deny ", "confirm resend ")):
             return False
         if not self.db.claim_control(guid):
             return True
-        if command == "help":
+        if command in {"approve", "deny"} or command.startswith(("approve ", "deny ")):
+            parts = command.split()
+            if len(parts) != 2 or not re.fullmatch(r"[0-9a-f]{8}", parts[1]):
+                self.send(chat_id, "格式：/ds approve <8位审批编号> 或 /ds deny <8位审批编号>")
+                return True
+            with self.active_lock:
+                pending = self.pending_approval
+            if (pending is None or pending.chat_id != chat_id
+                    or pending.request_id[:8] != parts[1]
+                    or time.monotonic() >= pending.deadline):
+                self.send(chat_id, "审批编号无效、已过期或不属于当前会话；没有提升权限。")
+                return True
+            outcome = "allowed-once" if parts[0] == "approve" else "rejected"
+            settled = self.settle_approval(pending.request_id, outcome)
+            self.send(chat_id, f"审批 {parts[1]} 已{'单次批准' if outcome == 'allowed-once' else '拒绝'}。"
+                      if settled else "审批已失效；没有提升权限。")
+        elif command == "help":
             self.send(chat_id, CONTROL_GUIDE)
+        elif command == "pending":
+            pending_tasks = self.db.pending_confirmations(chat_id)
+            self.send(chat_id, "待确认任务：" + ("、".join(pending_tasks) if pending_tasks else "无")
+                      + "。若丢失确认码，使用 /ds confirm resend <任务编号>。")
+        elif command.startswith("confirm resend "):
+            parts = command.split()
+            if len(parts) != 3 or not re.fullmatch(r"[0-9a-f]{8}", parts[2]):
+                self.send(chat_id, "格式：/ds confirm resend <8位任务编号>")
+            else:
+                code = f"{secrets.randbelow(1_000_000):06d}"
+                digest = hashlib.sha256(f"{parts[2]}:{code}".encode()).hexdigest()
+                if self.db.resend_confirmation(parts[2], chat_id, digest):
+                    self.send(chat_id, f"安全确认｜任务 #{parts[2]} 的旧确认码已失效。"
+                              f"若确认执行，请回复 /ds confirm {parts[2]} {code}")
+                else:
+                    self.send(chat_id, "该任务不存在、已不待确认，或不属于此会话。")
         elif command in {"status", "states"}:
             with self.active_lock:
                 active = self.active_task_id or "无"
                 paused = self.paused
                 streaming = self.stream_enabled
                 session_id = self.current_session_id or "待创建"
+                approval = self.pending_approval.request_id[:8] if self.pending_approval else "无"
+            pending_tasks = self.db.pending_confirmations(chat_id)
             self.send(chat_id, f"桥接状态：{'暂停' if paused else '运行'}；"
                       f"流式回传{'开' if streaming else '关'}；当前任务 {active}；"
-                      f"排队 {self.tasks.qsize()}；会话 {session_id}。\n\n{CONTROL_GUIDE}")
+                      f"排队 {self.tasks.qsize()}；会话 {session_id}；待审批 {approval}；"
+                      f"待确认任务 {','.join(pending_tasks) if pending_tasks else '无'}。\n\n{CONTROL_GUIDE}")
         elif command == "new mission":
             self.db.set_setting("new_mission_pending", "1")
             self.tasks.put(NewMission(chat_id))
@@ -578,6 +771,10 @@ class Bridge:
             self.db.set_setting("paused", "0")
             self.send(chat_id, "已恢复桥接任务执行。")
         elif command == "stop":
+            with self.active_lock:
+                pending = self.pending_approval
+            if pending is not None:
+                self.settle_approval(pending.request_id, "rejected")
             with self.active_lock:
                 self.paused = True
                 self.cancel_event.set()
@@ -670,7 +867,11 @@ class Bridge:
 
     def prepare_outbox(self, task_id: str) -> Path:
         outbox = self.config.outbox_root / task_id
-        outbox.mkdir(parents=True, exist_ok=False)
+        if outbox.is_symlink():
+            raise OSError("发件目录不能是符号链接")
+        outbox.mkdir(parents=True, exist_ok=True)
+        if not outbox.is_dir() or outbox.is_symlink():
+            raise OSError("发件目录不是安全的普通目录")
         return outbox
 
     def prune_outbox(self, max_age_seconds: int = 24 * 3600) -> None:
@@ -927,7 +1128,9 @@ class Bridge:
                 if isinstance(task, NewMission):
                     with self.active_lock:
                         self.current_session_id = None
+                        self.session_link_failed = False
                     self.db.set_setting("session_id", "")
+                    self.db.set_setting("session_link_failed", "0")
                     self.db.set_setting("new_mission_pending", "0")
                     self.send(task.chat_id, "新聊天已就绪；下一条任务会创建新会话。")
                     continue
@@ -953,6 +1156,13 @@ class Bridge:
                     break
             self.stop_event.wait(0.1)
         else:
+            return
+        if self.session_link_failed:
+            self.db.update_status(task.task_id, "failed")
+            self.send(task.chat_id, "上次任务的 DSH 聊天未能定位；为避免擅自新开聊天，"
+                      "本任务未启动。请人工修复会话指针，或发送 /ds new mission。")
+            with self.active_lock:
+                self.active_task_id = None
             return
         self.db.update_status(task.task_id, "running")
         self.send(task.chat_id, f"进度｜任务 #{task.task_id}：DS Harness 已开始执行。")
@@ -984,9 +1194,12 @@ class Bridge:
             str(self.config.dsh_entry),
             "--profile",
             "headless",
+            "--patch",
+            str(Path(__file__).with_name("dsh-approval.patch.yml")),
         ]
         if session_id:
             command.extend(["--session-id", session_id])
+        command.append("--")
         command.append(build_harness_prompt(
             task,
             outbox,
@@ -1006,10 +1219,12 @@ class Bridge:
                 proc = subprocess.Popen(
                     command,
                     cwd=self.config.workspace,
+                    stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     start_new_session=True,
-                    env={**os.environ, "DSH_HOME": str(Path.home() / ".dsh")},
+                    env={**os.environ, "DSH_HOME": str(Path.home() / ".dsh"),
+                         "DS_BRIDGE_APPROVAL": "1"},
                 )
                 self.active_process = proc
             output = ""
@@ -1019,6 +1234,7 @@ class Bridge:
             last_heartbeat = started
             decoders = {"stdout": codecs.getincrementaldecoder("utf-8")("replace"),
                         "stderr": codecs.getincrementaldecoder("utf-8")("replace")}
+            stdout_buffer = ""
             selector = selectors.DefaultSelector()
             assert proc.stdout is not None and proc.stderr is not None
             selector.register(proc.stdout, selectors.EVENT_READ, "stdout")
@@ -1039,15 +1255,36 @@ class Bridge:
                             selector.unregister(key.fileobj)
                             tail = decoders[channel].decode(b"", final=True)
                             if channel == "stdout":
-                                output += tail
+                                stdout_buffer += tail
+                                for line in stdout_buffer.split("\n"):
+                                    if line.startswith(APPROVAL_PREFIX):
+                                        self.handle_approval_request(line.rstrip("\r"), task)
+                                    else:
+                                        output += line
+                                stdout_buffer = ""
                             else:
                                 errors += tail
                             continue
                         decoded = decoders[channel].decode(data)
                         if channel == "stdout":
-                            output += decoded
+                            stdout_buffer += decoded
+                            while "\n" in stdout_buffer:
+                                line, stdout_buffer = stdout_buffer.split("\n", 1)
+                                if line.startswith(APPROVAL_PREFIX):
+                                    self.handle_approval_request(line.rstrip("\r"), task)
+                                else:
+                                    output += line + "\n"
+                            if len(stdout_buffer) > 16384:
+                                output += stdout_buffer
+                                stdout_buffer = ""
                         else:
                             errors = (errors + decoded)[-8192:]
+                    with self.active_lock:
+                        pending = self.pending_approval
+                    if pending is not None and now >= pending.deadline:
+                        if self.settle_approval(pending.request_id, "rejected"):
+                            self.send(task.chat_id, f"权限请求 {pending.request_id[:8]} 已超时，"
+                                      "自动拒绝；任务会继续处理该拒绝结果。")
                     with self.active_lock:
                         streaming = self.stream_enabled
                     if streaming and len(output) > sent_end and (
@@ -1078,6 +1315,8 @@ class Bridge:
                 selector.close()
                 proc.stdout.close()
                 proc.stderr.close()
+                if proc.stdin is not None:
+                    proc.stdin.close()
             proc.wait()
             if self.cancelled_task_id == task.task_id:
                 self.db.update_status(task.task_id, "stopped")
@@ -1097,23 +1336,26 @@ class Bridge:
                 self.send(task.chat_id, f"任务 #{task.task_id} 执行失败：{safe_detail}")
                 return
 
+            session_link_problem = False
             if not session_id:
                 created = self.register_new_sessions(existing_sessions)
                 sessions_registered = True
                 if len(created) != 1:
-                    self.db.update_status(task.task_id, "failed")
-                    self.send(task.chat_id, f"任务 #{task.task_id} 已得到模型结果，但无法唯一定位"
-                              "新聊天；为避免后续任务误开会话，桥接器已停止续接。请人工检查。")
-                    return
-                session_id = created[0]
-                with self.active_lock:
-                    self.current_session_id = session_id
-                self.db.set_setting("session_id", session_id)
-            if not self.register_workspace_sessions([session_id]):
+                    session_link_problem = True
+                    self.session_link_failed = True
+                    self.db.set_setting("session_link_failed", "1")
+                else:
+                    session_id = created[0]
+                    with self.active_lock:
+                        self.current_session_id = session_id
+                    self.db.set_setting("session_id", session_id)
+                    self.db.set_setting("session_link_failed", "0")
+            if session_id and not self.register_workspace_sessions([session_id]):
                 self.send(task.chat_id, "提示：任务仍在桥接工作目录中完成，但桌面端工作区索引"
-                          "未能登记此聊天；请检查 iMessage桥接 工作区是否存在。")
+                          "未能登记此聊天；请检查配置的桥接工作区是否存在。")
 
-            self.db.update_status(task.task_id, "completed")
+            self.db.update_status(task.task_id,
+                                  "completed_unlinked" if session_link_problem else "completed")
             with self.active_lock:
                 streaming = self.stream_enabled
             if streaming:
@@ -1130,12 +1372,17 @@ class Bridge:
                     f"结果 {index}/{len(chunks)}｜任务 #{task.task_id}\n{chunk}",
                 )
             self.deliver_outbox(task)
+            if session_link_problem:
+                self.send(task.chat_id, "警告：本任务结果和文件已回传，但无法唯一定位新聊天。"
+                          "后续任务已被阻止自动新开会话；请人工检查，或发送 /ds new mission。")
             self.send(task.chat_id, f"任务 #{task.task_id} 已完成。")
         except OSError as exc:
             self.db.update_status(task.task_id, "failed")
             logging.exception("task %s failed", task.task_id)
             self.send(task.chat_id, f"任务 #{task.task_id} 启动失败：{exc}")
         finally:
+            with self.active_lock:
+                self.pending_approval = None
             if not sessions_registered:
                 self.register_new_sessions(existing_sessions)
             with self.active_lock:
@@ -1165,28 +1412,75 @@ class Bridge:
                     command,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    text=True,
-                    bufsize=1,
+                    start_new_session=True,
                 )
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    if self.stop_event.is_set():
-                        proc.terminate()
-                        break
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        logging.warning("ignored invalid JSON from imsg")
-                        continue
-                    self.handle_event(event)
-                stderr = proc.stderr.read().strip() if proc.stderr else ""
-                if stderr:
-                    logging.error("imsg watcher stopped: %s", stderr)
+                assert proc.stdout is not None and proc.stderr is not None
+                selector = selectors.DefaultSelector()
+                selector.register(proc.stdout, selectors.EVENT_READ, "stdout")
+                selector.register(proc.stderr, selectors.EVENT_READ, "stderr")
+                decoder = codecs.getincrementaldecoder("utf-8")("replace")
+                buffered = ""
+                stderr = ""
+                try:
+                    while not self.stop_event.is_set() and selector.get_map():
+                        for key, _ in selector.select(timeout=0.5):
+                            data = os.read(key.fd, 4096)
+                            if not data:
+                                selector.unregister(key.fileobj)
+                                if key.data == "stdout":
+                                    buffered += decoder.decode(b"", final=True)
+                                continue
+                            if key.data == "stderr":
+                                stderr = (stderr + data.decode("utf-8", "replace"))[-8192:]
+                                continue
+                            buffered += decoder.decode(data)
+                            while "\n" in buffered:
+                                line, buffered = buffered.split("\n", 1)
+                                self.handle_watch_line(line)
+                    if buffered.strip() and not self.stop_event.is_set():
+                        self.handle_watch_line(buffered)
+                finally:
+                    selector.close()
+                    if proc.poll() is None or self.stop_event.is_set():
+                        try:
+                            os.killpg(proc.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            proc.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                os.killpg(proc.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            proc.wait(timeout=2)
+                    proc.stdout.close()
+                    proc.stderr.close()
+                if stderr.strip() and not self.stop_event.is_set():
+                    logging.error("imsg watcher stopped: %s", stderr.strip())
             except OSError:
                 logging.exception("unable to start imsg watcher")
             if not self.stop_event.wait(5):
                 logging.info("restarting imsg watcher")
+        with self.active_lock:
+            self.cancelled_task_id = self.active_task_id
+            pending = self.pending_approval
+        if pending is not None:
+            self.settle_approval(pending.request_id, "rejected")
+        self.terminate_active()
+        watcher.join(timeout=3)
         return 0
+
+    def handle_watch_line(self, line: str) -> None:
+        if not line.strip():
+            return
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            logging.warning("ignored invalid JSON from imsg")
+            return
+        if isinstance(event, dict):
+            self.handle_event(event)
 
 
 def validate(config: Config) -> list[str]:
@@ -1203,6 +1497,8 @@ def validate(config: Config) -> list[str]:
         ("node", config.node),
         ("dsh_entry", config.dsh_entry),
         ("attachment_copy_helper", config.attachment_copy_helper),
+        ("dsh_approval_plugin", Path(__file__).with_name("dsh_approval.mjs")),
+        ("dsh_approval_patch", Path(__file__).with_name("dsh-approval.patch.yml")),
     ):
         if not path.exists():
             problems.append(f"{label} does not exist: {path}")

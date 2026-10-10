@@ -1,0 +1,4 @@
+# Loaded only by this bridge's headless invocation via --patch.
+- insert:
+    - id: imessage-bridge-approval
+      name: ./dsh_approval.mjs
