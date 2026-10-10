@@ -486,6 +486,10 @@ class StateDB:
 class Bridge:
     def __init__(self, config: Config):
         self.config = config
+        # Do not execute history emitted by imsg after a database sync/rebuild.
+        # A restart deliberately starts a new live-only window; old commands
+        # (including stop/resume/approve) must never be replayed.
+        self.started_at = datetime.now(timezone.utc)
         self.db = StateDB(config.state_db)
         self.tasks: queue.Queue[Task | NewMission] = queue.Queue()
         self.stop_event = threading.Event()
@@ -549,6 +553,15 @@ class Bridge:
         self.register_workspace_sessions(session_ids)
         return sorted(session_ids)
 
+    def reconcile_current_session(self) -> None:
+        # The desktop app may rewrite workspace.json from stale in-memory state
+        # after a headless run. Keep the active bridge chat visible in its
+        # workspace, but leave unrelated/older chats alone.
+        with self.active_lock:
+            session_id = self.current_session_id
+        if session_id and self.session_exists_in_workspace(session_id):
+            self.register_workspace_sessions([session_id])
+
     def register_workspace_sessions(self, session_ids: list[str]) -> bool:
         index = Path.home() / ".dsh" / "storages" / "workspace.json"
         for attempt in range(3):
@@ -567,6 +580,15 @@ class Bridge:
                 for session_id in sorted(session_ids):
                     if session_id not in ids:
                         ids.append(session_id)
+                        changed = True
+                # A chat belongs to one desktop workspace, not two.
+                for other in rows.values():
+                    if other is row:
+                        continue
+                    other_ids = other.get("sessionIds", [])
+                    retained = [item for item in other_ids if item not in session_ids]
+                    if len(retained) != len(other_ids):
+                        other["sessionIds"] = retained
                         changed = True
                 global_state = data.setdefault("global", {})
                 archived = global_state.get("archivedSessionIds", [])
@@ -743,6 +765,7 @@ class Bridge:
                 else:
                     self.send(chat_id, "该任务不存在、已不待确认，或不属于此会话。")
         elif command in {"status", "states"}:
+            self.reconcile_current_session()
             with self.active_lock:
                 active = self.active_task_id or "无"
                 paused = self.paused
@@ -1041,6 +1064,19 @@ class Bridge:
         guid = str(event.get("guid") or "")
         chat_id = event.get("chat_id")
         if not guid or not isinstance(chat_id, int):
+            return
+        created_at = event.get("created_at")
+        try:
+            if not isinstance(created_at, str):
+                raise ValueError("missing message timestamp")
+            sent_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            if sent_at.tzinfo is None:
+                raise ValueError("message timestamp has no timezone")
+        except ValueError:
+            logging.warning("ignored command with missing or invalid message timestamp")
+            return
+        if sent_at < self.started_at:
+            logging.info("ignored pre-start iMessage command")
             return
 
         body = text[len(self.config.command_prefix) :].strip()
@@ -1395,11 +1431,17 @@ class Bridge:
         watcher = threading.Thread(target=self.worker, name="task-worker", daemon=True)
         watcher.start()
         self.prune_outbox()
+        next_reconcile = 0.0
         while not self.stop_event.is_set():
+            if time.monotonic() >= next_reconcile:
+                self.reconcile_current_session()
+                next_reconcile = time.monotonic() + 60
             command = [
                 str(self.config.imsg),
                 "watch",
                 "--json",
+                "--start",
+                self.started_at.isoformat().replace("+00:00", "Z"),
                 "--participants",
                 self.config.allowed_sender,
                 "--debounce",
@@ -1423,6 +1465,9 @@ class Bridge:
                 stderr = ""
                 try:
                     while not self.stop_event.is_set() and selector.get_map():
+                        if time.monotonic() >= next_reconcile:
+                            self.reconcile_current_session()
+                            next_reconcile = time.monotonic() + 60
                         for key, _ in selector.select(timeout=0.5):
                             data = os.read(key.fd, 4096)
                             if not data:

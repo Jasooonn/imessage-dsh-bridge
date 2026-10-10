@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 import json
+from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -199,12 +200,31 @@ class BridgeControlTest(unittest.TestCase):
         self.bridge.db.conn.close()
         self._tmp.cleanup()
 
-    def event(self, guid, text, attachments=None):
+    def event(self, guid, text, attachments=None, created_at=None):
         self.bridge.handle_event({
             "guid": guid, "chat_id": 1, "sender": "+8613800138000",
             "text": text, "is_from_me": False, "is_group": False,
             "attachments": attachments or [],
+            "created_at": (datetime.now(timezone.utc).isoformat()
+                           if created_at is None else created_at),
         })
+
+    def test_replayed_history_cannot_queue_or_change_controls(self):
+        old = (self.bridge.started_at - timedelta(days=2)).isoformat()
+        self.event("old-task", "/ds 执行旧任务", created_at=old)
+        self.event("old-resume", "/ds resume", created_at=old)
+        self.assertEqual(self.bridge.db.status_counts(), {})
+        self.assertEqual(self.bridge.db.get_setting("paused", "0"), "0")
+        self.assertEqual(self.messages, [])
+
+    def test_timestamp_must_be_valid_and_timezone_aware(self):
+        for index, timestamp in enumerate(("bad", "2026-10-10T17:47:00", "")):
+            self.event(f"invalid-{index}", "/ds status", created_at=timestamp)
+        self.assertEqual(self.messages, [])
+
+    def test_current_message_is_accepted(self):
+        self.event("current-status", "/ds status")
+        self.assertTrue(any("交互指南" in message for message in self.messages))
 
     def test_pause_resume_and_stream_settings_persist(self):
         self.event("pause-1", "/ds pause")
@@ -371,6 +391,28 @@ class BridgeControlTest(unittest.TestCase):
         self.assertIn("session-abc123", result["tables"]["workspaces"]["one"]["sessionIds"])
         self.assertIn("global", result)
         self.assertEqual(len(list(index.parent.glob("workspace.bridge-backup-*.json"))), 1)
+
+    def test_status_restores_current_chat_to_bridge_workspace(self):
+        home = Path(self._tmp.name) / "home"
+        index = home / ".dsh" / "storages" / "workspace.json"
+        index.parent.mkdir(parents=True)
+        session_id = "session-current"
+        index.write_text(json.dumps({
+            "global": {"archivedSessionIds": [session_id, "session-other"]},
+            "tables": {"workspaces": {"bridge": {
+                "path": str(self.config.workspace), "sessionIds": []},
+                "other": {"path": "/other", "sessionIds": ["session-other", session_id]}}},
+        }), encoding="utf-8")
+        self.bridge.current_session_id = session_id
+        with mock.patch("bridge.Path.home", return_value=home), \
+             mock.patch.object(self.bridge, "session_exists_in_workspace", return_value=True):
+            self.event("status-reconcile", "/ds status")
+        result = json.loads(index.read_text(encoding="utf-8"))
+        self.assertIn(session_id, result["tables"]["workspaces"]["bridge"]["sessionIds"])
+        self.assertNotIn(session_id, result["global"]["archivedSessionIds"])
+        self.assertIn("session-other", result["global"]["archivedSessionIds"])
+        self.assertEqual(result["tables"]["workspaces"]["other"]["sessionIds"],
+                         ["session-other"])
 
     def test_stream_on_uses_stream_messages(self):
         fake = Path(self._tmp.name) / "fake_stream.py"
