@@ -1,0 +1,14 @@
+config.json
+*.db
+*.sqlite3
+*.sqlite3-*
+*.log
+*.bak*
+__pycache__/
+*.py[cod]
+.DS_Store
+.dsh/
+.ds-outbox/
+inbox/
+projects/
+dist/
